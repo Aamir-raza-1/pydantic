@@ -36,6 +36,33 @@ def _out():
 
 
 @pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector: pytest.Collector):
+    """Importing a test module runs code too (models, schemas, parametrize lists, files read by
+    pytest-examples): record it as the test FILE's own window and coverage context
+    ("<file>|collect"), so module-level work in test files is attributed to that file."""
+    if not isinstance(collector, pytest.Module):
+        yield
+        return
+    cov = None
+    try:
+        import coverage  # noqa: PLC0415
+
+        cov = coverage.Coverage.current()
+    except Exception:  # noqa: BLE001
+        cov = None
+    if cov is not None:
+        cov.switch_context(f"{collector.nodeid}|collect")
+    start = time.monotonic_ns()
+    yield
+    end = time.monotonic_ns()
+    if cov is not None:
+        cov.switch_context("")
+    out = _out()
+    out.write(json.dumps({"nodeid": collector.nodeid, "pid": os.getpid(), "start_ns": start, "end_ns": end, "outcome": "collect"}) + "\n")
+    out.flush()
+
+
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     start = time.monotonic_ns()
     yield

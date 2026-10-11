@@ -159,6 +159,7 @@ def main():
     repo = os.path.abspath(args.repo)
 
     tests = {}
+    collect_windows = set()
     cov_all, ebpf_all = collections.defaultdict(set), collections.defaultdict(set)
     import_time_only, executed = set(), collections.defaultdict(set)
     timing, opens_seen, opens_attr = {}, 0, 0
@@ -168,7 +169,10 @@ def main():
         windows = load_windows(gdir, repo)
         for ws in windows.values():
             for _, _, nodeid, outcome in ws:
-                tests[nodeid] = outcome
+                if outcome == "collect":
+                    collect_windows.add(nodeid)  # a test file's import (collection) window, not a test
+                else:
+                    tests[nodeid] = outcome
         c, unattr = coverage_deps(gdir, roots, repo, executed)
         e, seen, attr = ebpf_deps(gdir, windows, roots, repo)
         opens_seen += seen
@@ -186,7 +190,8 @@ def main():
         if os.path.exists(os.path.join(gdir, "junit-baseline.xml")):
             secs_base.update(junit_seconds(os.path.join(gdir, "junit-baseline.xml"), repo))
 
-    merged = {n: cov_all.get(n, set()) | ebpf_all.get(n, set()) for n in tests}
+    # tests + test-file collection windows (key = the file path itself)
+    merged = {n: cov_all.get(n, set()) | ebpf_all.get(n, set()) for n in set(tests) | collect_windows | {k for k in cov_all if "::" not in k}}
     by_file = collections.defaultdict(set)
     for n, ds in merged.items():
         for kind, name in ds:
@@ -200,8 +205,12 @@ def main():
             tests_with_noncode += 1
         for d in extra:
             ebpf_only_noncode[d[1]] += 1
-    tfiles = sorted({n.split("::")[0] for n in tests})
+    tfiles = sorted({n.split("::")[0] for n in tests} | {k for k in merged if "::" not in k})
     no_deps = [n for n in tests if not merged[n]]
+    collect_only = collections.Counter()  # repo files a test file needs only through its import (collection)
+    for t in tfiles:
+        during_tests = set().union(*[merged[n] for n in tests if n.split("::")[0] == t] or [set()])
+        collect_only[t] = len(merged.get(t, set()) - during_tests)
     report = {
         "tests": len(tests),
         "test_files": len(tfiles),
@@ -209,6 +218,9 @@ def main():
         "outcomes": collections.Counter(tests.values()),
         "timing": timing,
         "tests_without_any_dependency": len(no_deps),
+        "test_files_with_collection_window": len(collect_windows),
+        "test_files_with_deps_only_at_collection": sum(1 for v in collect_only.values() if v),
+        "deps_only_at_collection_median_per_file": statistics.median(collect_only.values()) if collect_only else None,
         "tests_without_any_dependency_sample": sorted(no_deps)[:20],
         "deps_per_test_median": {
             "coverage": statistics.median([len(cov_all.get(n, ())) for n in tests]) if tests else None,
