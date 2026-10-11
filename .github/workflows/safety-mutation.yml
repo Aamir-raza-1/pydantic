@@ -23,6 +23,12 @@ on:
         default: "8"
       python:
         default: "3.14"
+      only_batches:
+        description: JSON list of batch ids to (re-)run instead of all (baseline 0 is always run)
+        default: ""
+      pytest_args:
+        description: Extra pytest args (e.g. --continue-on-collection-errors for mutants that break imports)
+        default: ""
 
 permissions:
   contents: read
@@ -53,6 +59,7 @@ jobs:
           SEED: ${{ inputs.seed }}
           PER_FILE: ${{ inputs.per_file }}
           CHUNKS: ${{ inputs.chunks }}
+          ONLY: ${{ inputs.only_batches }}
         run: |
           python ci_trace/mutate.py generate ci_trace/mutation_targets.json --seed "$SEED" --out mutation \
             --executed analysis/executed_lines.json.gz --per-file "$PER_FILE"
@@ -60,7 +67,8 @@ jobs:
           import json, os
           n = len(json.load(open("mutation/batches.json"))) - 1
           k = int(os.environ["CHUNKS"])
-          chunks = [list(range(1 + i, n + 1, k)) for i in range(k)]
+          ids = json.loads(os.environ["ONLY"]) if os.environ.get("ONLY") else list(range(1, n + 1))
+          chunks = [ids[i::k] for i in range(k)]
           json.dump(chunks, open("mutation/chunks.json", "w"))
           open(os.environ["GITHUB_OUTPUT"], "a").write("chunks=%s\n" % json.dumps(list(range(k))))
           EOF
@@ -101,6 +109,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: 1
           CHUNK: ${{ matrix.chunk }}
+          EXTRA: ${{ inputs.pytest_args }}
         run: |
           mkdir -p junit
           TO=""; uv run --no-sync python -c "import pytest_timeout" 2>/dev/null && TO="--timeout=120"
@@ -112,7 +121,7 @@ jobs:
             uv run --no-sync python ci_trace/mutate.py apply mutation "$b"
             start=$(date +%s)
             rc=0
-            timeout 900 uv run --no-sync python -m pytest -p no:cacheprovider -q $TO \
+            timeout 900 uv run --no-sync python -m pytest -p no:cacheprovider -q $TO $EXTRA \
               --junitxml=junit/junit-b${b}-g${CHUNK}.xml -o junit_family=legacy > junit/out-b${b}.txt 2>&1 || rc=$?
             echo "batch $b rc=$rc seconds=$(( $(date +%s) - start )) $(tail -1 junit/out-b${b}.txt)" | tee -a junit/summary-g${CHUNK}.txt
           done
