@@ -1,0 +1,78 @@
+name: Isolate mutants (confirm kills and misses)
+
+# Experiment for github.com/Aamir-raza-1/ci-casestudies (not part of pydantic).
+# Applies ONE mutant at a time (0 = none) and runs the given test files N times, so a failure
+# credited to a planted bug is confirmed as caused by it (fails every time with it, never without).
+# Pass test paths as CI collects them (tests/pydantic_core/..., not pydantic-core/tests/...): pytest
+# picks its config from the paths' common ancestor; junit is canonicalized to real paths afterwards.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mutation_run_id:
+        description: Run ID of the safety-mutation run (for its mutation artifact)
+        required: true
+      mutants:
+        description: JSON list of mutant ids, 0 = baseline
+        required: true
+      tests:
+        description: Test paths (space separated)
+        required: true
+      repeats:
+        default: "3"
+      python:
+        default: "3.14"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  UV_FROZEN: true
+
+jobs:
+  run:
+    name: Mutant ${{ matrix.mutant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: ${{ fromJson(inputs.mutants) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pydantic-core
+          shared-key: trace
+          save-if: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ inputs.python }}
+          enable-cache: true
+      - run: uv sync --all-packages --group testing-extra --all-extras
+      - uses: actions/download-artifact@v4
+        with:
+          name: mutation
+          path: mutation
+          run-id: ${{ inputs.mutation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Apply mutant and run tests N times
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+          TESTS: ${{ inputs.tests }}
+          REPEATS: ${{ inputs.repeats }}
+          MUTANT: ${{ matrix.mutant }}
+        run: |
+          if [ "$MUTANT" != "0" ]; then uv run --no-sync python ci_trace/mutate.py apply-ids mutation "$MUTANT"; fi
+          mkdir -p out
+          for i in $(seq 1 "$REPEATS"); do
+            uv run --no-sync python -m pytest -p no:cacheprovider -q --junitxml=out/junit-m${MUTANT}-r${i}.xml -o junit_family=legacy $TESTS > out/run-${i}.txt 2>&1 || true
+            echo "repeat $i: $(tail -1 out/run-${i}.txt)"
+          done
+          git checkout -q -- pydantic pydantic-core/python
+          python3 ci_trace/canon_junit.py . out/*.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isolate-m${{ matrix.mutant }}
+          path: out/*.xml
