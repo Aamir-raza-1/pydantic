@@ -4,8 +4,8 @@ Generic version of the HA tracer's mutate.py, with one change from the HA lesson
 survived because they sat on lines no test runs": body mutants are only planted on lines the
 traced run executed (executed_lines.json.gz from analyze.py).
 
-generate: python ci_trace/mutate.py generate targets.json --seed 1 --out mutation --executed executed_lines.json.gz
-  Per target file: up to one body mutant (negate a one-line `if` test, or `return None`) on an
+generate: python ci_trace/mutate.py generate targets.json --seed 1 --out mutation --executed executed_lines.json.gz [--per-file 2]
+  Per target file: up to --per-file body mutants (negate a one-line `if` test, or `return None`) on an
   executed line, and one module mutant (change a top-level int/str constant). One mutant per
   batch (the suite is fast enough), so every failure belongs to exactly one bug.
 
@@ -76,7 +76,7 @@ def _valid(path: str, m: dict) -> bool:
     return True
 
 
-def generate(targets_file: str, seed: int, out: str, executed_file: str | None) -> None:
+def generate(targets_file: str, seed: int, out: str, executed_file: str | None, per_file: int = 1) -> None:
     rng = random.Random(seed)
     targets = json.loads(Path(targets_file).read_text())
     executed = {}
@@ -90,13 +90,14 @@ def generate(targets_file: str, seed: int, out: str, executed_file: str | None) 
         except (SyntaxError, FileNotFoundError) as err:
             skipped.append({"file": path, "why": str(err)})
             continue
-        for kind, pool in (("body", body), ("module", module)):
+        for kind, pool, want in (("body", body, per_file), ("module", module, 1)):
             rng.shuffle(pool)
+            got = 0
             for m in pool:
-                if _valid(path, m):
+                if got < want and _valid(path, m):
                     mutants.append({"id": len(mutants) + 1, "file": path, "kind": kind, **m})
-                    break
-            else:
+                    got += 1
+            if not got:
                 skipped.append({"file": path, "why": "no executed %s candidate" % kind})
     batches = [[]] + [[m["id"]] for m in mutants]  # batch 0 = baseline; one mutant per batch
     Path(out).mkdir(parents=True, exist_ok=True)
@@ -132,6 +133,7 @@ if __name__ == "__main__":
         apply_ids(sys.argv[2], [int(x) for x in sys.argv[3].split(",") if x])
     elif sys.argv[1] == "generate":
         ex = sys.argv[sys.argv.index("--executed") + 1] if "--executed" in sys.argv else None
-        generate(sys.argv[2], int(sys.argv[sys.argv.index("--seed") + 1]), sys.argv[sys.argv.index("--out") + 1], ex)
+        per = int(sys.argv[sys.argv.index("--per-file") + 1]) if "--per-file" in sys.argv else 1
+        generate(sys.argv[2], int(sys.argv[sys.argv.index("--seed") + 1]), sys.argv[sys.argv.index("--out") + 1], ex, per)
     else:
         apply(sys.argv[2], int(sys.argv[3]))

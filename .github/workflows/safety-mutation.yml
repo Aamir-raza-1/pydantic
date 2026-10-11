@@ -1,0 +1,125 @@
+name: Safety check (mutation)
+
+# Experiment for github.com/Aamir-raza-1/ci-casestudies (not part of pydantic).
+# Plants one small bug (mutant) at a time on a line the traced run executed, in files changed by
+# real pydantic PRs, runs the FULL suite per mutant, and keeps junit per mutant. The selection check
+# (did our selection hold every test file a bug made fail?) runs offline with `engine verify`.
+# Chunks: every job runs the baseline (batch 0, nothing applied) first, then its share of mutants.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Random seed for mutant choice
+        default: "1"
+      per_file:
+        description: Body mutants per target file
+        default: "2"
+      trace_run_id:
+        description: Run ID of the "Trace tests" run whose analysis artifact has executed_lines.json.gz
+        required: true
+      chunks:
+        description: Parallel jobs
+        default: "8"
+      python:
+        default: "3.14"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  COLUMNS: 150
+  UV_FROZEN: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      chunks: ${{ steps.gen.outputs.chunks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: analysis
+          path: analysis
+          run-id: ${{ inputs.trace_run_id }}
+          github-token: ${{ github.token }}
+      - id: gen
+        env:
+          SEED: ${{ inputs.seed }}
+          PER_FILE: ${{ inputs.per_file }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          python ci_trace/mutate.py generate ci_trace/mutation_targets.json --seed "$SEED" --out mutation \
+            --executed analysis/executed_lines.json.gz --per-file "$PER_FILE"
+          python - <<'EOF'
+          import json, os
+          n = len(json.load(open("mutation/batches.json"))) - 1
+          k = int(os.environ["CHUNKS"])
+          chunks = [list(range(1 + i, n + 1, k)) for i in range(k)]
+          json.dump(chunks, open("mutation/chunks.json", "w"))
+          open(os.environ["GITHUB_OUTPUT"], "a").write("chunks=%s\n" % json.dumps(list(range(k))))
+          EOF
+          cat mutation/chunks.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutation
+          path: mutation/
+
+  run:
+    name: Chunk ${{ matrix.chunk }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.prepare.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pydantic-core
+          shared-key: trace
+          save-if: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ inputs.python }}
+          enable-cache: true
+      - name: Install (same as pydantic CI's test job)
+        run: uv sync --all-packages --group testing-extra --all-extras
+      - uses: actions/download-artifact@v4
+        with:
+          name: mutation
+          path: mutation
+      - name: Baseline + one mutant at a time, full suite each
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+          CHUNK: ${{ matrix.chunk }}
+        run: |
+          mkdir -p junit
+          TO=""; uv run --no-sync python -c "import pytest_timeout" 2>/dev/null && TO="--timeout=120"
+          echo "per-test timeout: ${TO:-none (pytest-timeout not installed)}"
+          batches="0 $(python3 -c "import json; print(' '.join(map(str, json.load(open('mutation/chunks.json'))[$CHUNK])))")"
+          for b in $batches; do
+            git checkout -q -- pydantic pydantic-core/python
+            find pydantic pydantic-core/python -name __pycache__ -type d -prune -exec rm -rf {} +
+            uv run --no-sync python ci_trace/mutate.py apply mutation "$b"
+            start=$(date +%s)
+            rc=0
+            timeout 900 uv run --no-sync python -m pytest -p no:cacheprovider -q $TO \
+              --junitxml=junit/junit-b${b}-g${CHUNK}.xml -o junit_family=legacy > junit/out-b${b}.txt 2>&1 || rc=$?
+            echo "batch $b rc=$rc seconds=$(( $(date +%s) - start )) $(tail -1 junit/out-b${b}.txt)" | tee -a junit/summary-g${CHUNK}.txt
+          done
+          git checkout -q -- pydantic pydantic-core/python
+          python3 ci_trace/canon_junit.py . junit/*.xml > /dev/null
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-chunk-${{ matrix.chunk }}
+          path: junit/
