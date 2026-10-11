@@ -1,0 +1,5 @@
+# Trace-only coverage config: measure everything (no omit), per-test contexts come from pytest-cov.
+[run]
+source = pydantic, pydantic_core
+relative_files = true
+branch = false

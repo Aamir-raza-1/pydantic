@@ -1,0 +1,181 @@
+name: Trace tests (CI test-selection experiment)
+
+# Experiment for github.com/Aamir-raza-1/ci-casestudies (not part of pydantic).
+# Runs pydantic's own test suite (what `make test` runs: pytest over testpaths=tests, which includes
+# tests/pydantic_core -> pydantic-core/tests) twice per shard:
+#   baseline  untraced, junit only (real seconds per test file)
+#   traced    per-test coverage contexts (pytest-cov --cov-context=test, COVERAGE_CORE=ctrace)
+#             + eBPF file opens (bpftrace) -> every repo file each test executed or opened
+# then an analyze job builds the file -> tests map, the static import map and the executed-lines
+# list next to the data and uploads only the small results ("analysis" artifact).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: pilot (given paths, 1 group) or full (whole suite, N groups)
+        type: choice
+        options: [pilot, full]
+        default: pilot
+      paths:
+        description: Test paths for pilot mode
+        default: tests/test_main.py tests/test_networks.py tests/pydantic_core/test_json.py tests/test_docs.py
+      groups:
+        description: Number of groups for full mode
+        default: "6"
+      python:
+        description: Python version
+        default: "3.14"
+
+permissions:
+  contents: read
+
+env:
+  COLUMNS: 150
+  UV_FROZEN: true
+  RUNNER_ROOT: /home/runner/work/pydantic/pydantic/
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      groups: ${{ steps.split.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pydantic-core
+          shared-key: trace
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ inputs.python }}
+          enable-cache: true
+      - name: Install (same as pydantic CI's test job) + pytest-cov
+        run: |
+          uv sync --all-packages --group testing-extra --all-extras
+          uv pip install pytest-cov
+      - id: split
+        env:
+          MODE: ${{ inputs.mode }}
+          PATHS: ${{ inputs.paths }}
+          GROUPS: ${{ inputs.groups }}
+        run: |
+          if [[ "$MODE" == "pilot" ]]; then
+            echo "$PATHS" > buckets.txt
+            echo "groups=[1]" >> "$GITHUB_OUTPUT"
+          else
+            uv run --no-sync python -m pytest --collect-only -q -p no:cacheprovider > collected.txt || true
+            tail -3 collected.txt
+            python3 ci_trace/shard.py collected.txt "$GROUPS" > buckets.txt
+            echo "groups=$(python3 -c "import json; print(json.dumps(list(range(1, $GROUPS + 1))))")" >> "$GITHUB_OUTPUT"
+          fi
+          wc -l buckets.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: buckets
+          path: |
+            buckets.txt
+            collected.txt
+          if-no-files-found: ignore
+
+  trace:
+    name: Trace group ${{ matrix.group }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJson(needs.prepare.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pydantic-core
+          shared-key: trace
+          save-if: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ inputs.python }}
+          enable-cache: true
+      - name: Install
+        run: |
+          uv sync --all-packages --group testing-extra --all-extras
+          uv pip install pytest-cov
+          sudo apt-get update -qq && sudo apt-get install -y -qq bpftrace
+      - uses: actions/download-artifact@v4
+        with:
+          name: buckets
+      - name: Baseline run (untraced; real seconds per test file)
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          mkdir -p trace
+          start=$(date +%s)
+          uv run --no-sync python -m pytest -p no:cacheprovider --junitxml=trace/junit-baseline.xml -o junit_family=legacy \
+            $(sed -n "${{ matrix.group }},1p" buckets.txt) > trace/baseline.txt 2>&1 || true
+          echo "baseline_seconds=$(( $(date +%s) - start ))" | tee -a trace/timing.txt
+          tail -3 trace/baseline.txt
+      - name: Traced run
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+          TRACE_DIR: ${{ github.workspace }}/trace
+          # coverage's sysmon core (3.12+ default) records a line only the first time it runs,
+          # so per-test contexts come out incomplete; ctrace records every test.
+          COVERAGE_CORE: ctrace
+        run: |
+          sudo BPFTRACE_MAX_STRLEN=200 bpftrace ci_trace/opens.bt > "$TRACE_DIR/opens.log" 2> bpftrace.err &
+          for i in $(seq 1 60); do grep -q "Attaching" bpftrace.err 2>/dev/null && break; sleep 1; done
+          cat bpftrace.err
+          start=$(date +%s)
+          uv run --no-sync python -m pytest -p no:cacheprovider -p ci_trace.pytest_trace_plugin \
+            --cov --cov-config=ci_trace/coveragerc --cov-context=test --cov-report= \
+            --junitxml=trace/junit.xml -o junit_family=legacy \
+            $(sed -n "${{ matrix.group }},1p" buckets.txt) > trace/traced.txt 2>&1 || true
+          echo "traced_seconds=$(( $(date +%s) - start ))" | tee -a trace/timing.txt
+          sudo pkill -INT bpftrace || true
+          sleep 3
+          tail -3 trace/traced.txt
+          mv .coverage trace/coverage.sqlite
+          git rev-parse HEAD > trace/commit.txt
+          gzip -9 trace/opens.log
+          ls -la trace | head -20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-group-${{ matrix.group }}
+          path: trace/
+          retention-days: 30
+
+  analyze:
+    needs: trace
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: trace-group-*
+          path: artifacts
+      - name: Analyze (map, seconds, executed lines) + static import map with the repo's Python
+        run: |
+          pip install -q coverage
+          du -sh artifacts/*
+          python ci_trace/analyze.py artifacts --root "$RUNNER_ROOT" --repo . --out out > out.log
+          python ci_trace/static_map.py . --source pydantic --source pydantic-core/python --test tests --test pydantic-core/tests \
+            --import-root pydantic-core/python --import-root pydantic-core --out out/static.json | tee out/static_report.txt
+          gzip -9 out/static.json
+          git rev-parse HEAD > out/commit.txt
+          echo "${{ github.run_id }}" > out/source_run_id.txt
+          python -c "import json; r=json.load(open('out/report.json')); print(json.dumps({k: r[k] for k in ['tests','test_files','outcomes','timing','tests_without_any_dependency','deps_per_test_median','tests_reading_noncode_files_invisible_to_coverage','top_noncode_files_invisible_to_coverage','seconds_total']}, indent=1, default=list))"
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: analysis
+          path: out/
+          retention-days: 30
