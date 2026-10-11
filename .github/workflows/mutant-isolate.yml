@@ -67,7 +67,7 @@ jobs:
           if [ "$MUTANT" != "0" ]; then uv run --no-sync python ci_trace/mutate.py apply-ids mutation "$MUTANT"; fi
           mkdir -p out
           for i in $(seq 1 "$REPEATS"); do
-            uv run --no-sync python -m pytest -p no:cacheprovider -q --junitxml=out/junit-m${MUTANT}-r${i}.xml -o junit_family=legacy $TESTS > out/run-${i}.txt 2>&1 || true
+            uv run --no-sync python -m pytest -p no:cacheprovider -q --continue-on-collection-errors --junitxml=out/junit-m${MUTANT}-r${i}.xml -o junit_family=legacy $TESTS > out/run-${i}.txt 2>&1 || true
             echo "repeat $i: $(tail -1 out/run-${i}.txt)"
           done
           git checkout -q -- pydantic pydantic-core/python
