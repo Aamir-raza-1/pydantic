@@ -1,0 +1,71 @@
+name: Revalidate 5x scenarios (DV8)
+
+on:
+  push:
+    branches:
+      - reval/5x
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: true
+
+jobs:
+  revalidate:
+    name: Revalidate 5 scenarios (pydantic)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pydantic-core
+          shared-key: trace
+          save-if: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync --all-packages --group testing-extra --all-extras
+      - name: Run 5 scenarios (clean + planted bug)
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          mkdir -p out
+          # Scenario 1: leaf component (pydantic/experimental/pipeline.py -> 3 test files)
+          t0=$(python3 -c 'import time; print(time.time())')
+          uv run --no-sync python -m pytest -p no:cacheprovider -q --junitxml=out/s1.xml -o junit_family=legacy \
+            tests/test_Docs.py tests/test_main.py tests/test_pipeline.py > out/s1.txt 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "S1_leaf sec=$(python3 -c "print(round($t1-$t0, 2))") $(tail -1 out/s1.txt)"
+
+          # Scenario 4: test-only (tests/test_pipeline.py -> 2 test files)
+          t0=$(python3 -c 'import time; print(time.time())')
+          uv run --no-sync python -m pytest -p no:cacheprovider -q --junitxml=out/s4.xml -o junit_family=legacy \
+            tests/test_Docs.py tests/test_pipeline.py > out/s4.txt 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "S4_test_only sec=$(python3 -c "print(round($t1-$t0, 2))") $(tail -1 out/s4.txt)"
+
+          # Scenario 5: planted bug in pydantic/experimental/pipeline.py line 362 (return None)
+          python3 -c '
+          p = "pydantic/experimental/pipeline.py"
+          txt = open(p).read()
+          assert "return self.predicate(lambda v: v.endswith(suffix))" in txt
+          open(p, "w").write(txt.replace("return self.predicate(lambda v: v.endswith(suffix))", "return None", 1))
+          '
+          t0=$(python3 -c 'import time; print(time.time())')
+          set +e
+          uv run --no-sync python -m pytest -p no:cacheprovider -q --junitxml=out/s5_selected.xml -o junit_family=legacy \
+            tests/test_Docs.py tests/test_main.py tests/test_pipeline.py > out/s5_selected.txt 2>&1
+          rc_sel=$?
+          set -e
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "S5_planted_bug_selected rc=$rc_sel sec=$(python3 -c "print(round($t1-$t0, 2))") $(tail -1 out/s5_selected.txt)"
+          git checkout -- pydantic/experimental/pipeline.py
+          python3 ci_trace/canon_junit.py . out/*.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reval-5x-pydantic
+          path: out/
